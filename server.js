@@ -92,10 +92,10 @@ wss.on('connection', (ws, req) => {
     }
     session.host = ws;
 
-    ws.on('message', (data) => {
-      // Forward every host message to all phone clients
+    ws.on('message', (data, isBinary) => {
+      // Forward every host message to all phone clients, preserving frame type
       session.clients.forEach((client) => {
-        if (client.readyState === 1) client.send(data);
+        if (client.readyState === 1) client.send(data, { binary: isBinary });
       });
     });
 
@@ -113,10 +113,10 @@ wss.on('connection', (ws, req) => {
   } else {
     session.clients.add(ws);
 
-    ws.on('message', (data) => {
-      // Forward every client message to the host (plugin)
+    ws.on('message', (data, isBinary) => {
+      // Forward every client message to the host (plugin), preserving frame type
       if (session.host && session.host.readyState === 1) {
-        session.host.send(data);
+        session.host.send(data, { binary: isBinary });
       }
     });
 
