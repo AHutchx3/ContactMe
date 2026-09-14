@@ -17,21 +17,190 @@
 
 const { WebSocketServer } = require('ws');
 const http = require('http');
+const http2 = require('http2');
+const crypto = require('crypto');
 const { URL } = require('url');
 
 const PORT = process.env.PORT || 3000;
 
-// ── HTTP server (health-check endpoint) ──────────────────────────────────────
-const httpServer = http.createServer((req, res) => {
+// ── APNs Live Activity relay config ──────────────────────────────────────────
+// All secrets ride Railway env vars. `APNS_KEY_P8` is the PEM contents of
+// the .p8 file (paste the full "-----BEGIN PRIVATE KEY-----..." blob).
+// APNS_ENV: 'production' (App Store / TestFlight) or 'development' (local
+// dev-signed builds). LA push tokens are environment-scoped — a prod
+// key can't push to a dev-signed app and vice versa.
+const APNS_KEY_P8    = (process.env.APNS_KEY_P8 || '').replace(/\\n/g, '\n');
+const APNS_KEY_ID    = process.env.APNS_KEY_ID    || '';
+const APNS_TEAM_ID   = process.env.APNS_TEAM_ID   || '';
+const APNS_BUNDLE_ID = process.env.APNS_BUNDLE_ID || 'com.hutchens.contactme';
+const APNS_ENV       = process.env.APNS_ENV       || 'production';
+// Shared secret the plugin sends as a Bearer token. If unset, the
+// endpoint is disabled — better to fail closed than accept anonymous
+// requests to a resource that costs real quota + touches APNs.
+const APNS_RELAY_TOKEN = process.env.APNS_RELAY_TOKEN || '';
+
+const APNS_READY = APNS_KEY_P8 && APNS_KEY_ID && APNS_TEAM_ID && APNS_RELAY_TOKEN;
+if (!APNS_READY) {
+  console.warn('[apns] Live Activity relay DISABLED — missing one of APNS_KEY_P8, APNS_KEY_ID, APNS_TEAM_ID, APNS_RELAY_TOKEN.');
+}
+
+// Pre-parse the private key once at boot so per-request signing is cheap.
+let APNS_PRIVATE_KEY = null;
+try {
+  if (APNS_KEY_P8) {
+    APNS_PRIVATE_KEY = crypto.createPrivateKey({ key: APNS_KEY_P8, format: 'pem' });
+  }
+} catch (e) {
+  console.warn('[apns] Failed to parse APNS_KEY_P8:', e.message);
+}
+
+// JWT cache — regenerate every 30 min. APNs accepts JWTs up to 60 min
+// old; halving it means slow clock drift never bumps us past the edge.
+let JWT_CACHE = null;
+let JWT_EXPIRES_MS = 0;
+function apnsJwt() {
+  if (JWT_CACHE && Date.now() < JWT_EXPIRES_MS) return JWT_CACHE;
+  const iat = Math.floor(Date.now() / 1000);
+  const header = Buffer.from(JSON.stringify({ alg: 'ES256', kid: APNS_KEY_ID, typ: 'JWT' })).toString('base64url');
+  const claims = Buffer.from(JSON.stringify({ iss: APNS_TEAM_ID, iat })).toString('base64url');
+  const input  = `${header}.${claims}`;
+  // dsaEncoding: 'ieee-p1363' produces r||s raw output — the format
+  // APNs / JWT ES256 requires, not the DER default.
+  const sig = crypto.sign('SHA256', Buffer.from(input), { key: APNS_PRIVATE_KEY, dsaEncoding: 'ieee-p1363' });
+  JWT_CACHE = `${input}.${sig.toString('base64url')}`;
+  JWT_EXPIRES_MS = Date.now() + 30 * 60 * 1000;
+  return JWT_CACHE;
+}
+
+/**
+ * POST a Live Activity update to Apple's push service. Returns
+ * { status, body } — the status is APNs's :status pseudo-header, and
+ * body is Apple's JSON-encoded error reason (empty on 200 success).
+ */
+function apnsSendLiveActivity({ token, contentState, event, dismissAfterSeconds }) {
+  return new Promise((resolve, reject) => {
+    const host = APNS_ENV === 'development' ? 'api.sandbox.push.apple.com' : 'api.push.apple.com';
+    const client = http2.connect(`https://${host}`);
+    // Guard against socket errors that fire before the request is sent.
+    client.on('error', (err) => reject(err));
+    const req = client.request({
+      ':method': 'POST',
+      ':path':   `/3/device/${token}`,
+      'apns-topic':     `${APNS_BUNDLE_ID}.push-type.liveactivity`,
+      'apns-push-type': 'liveactivity',
+      'apns-priority':  '10',
+      'authorization':  `bearer ${apnsJwt()}`,
+      'content-type':   'application/json',
+    });
+    const payload = {
+      aps: {
+        timestamp: Math.floor(Date.now() / 1000),
+        event,
+        'content-state': contentState,
+        ...(dismissAfterSeconds != null
+          ? { 'dismissal-date': Math.floor(Date.now() / 1000) + dismissAfterSeconds }
+          : {}),
+      },
+    };
+    let status = 0;
+    let body = '';
+    req.setEncoding('utf8');
+    req.on('response', (headers) => { status = headers[':status']; });
+    req.on('data', (chunk) => { body += chunk; });
+    req.on('end', () => { client.close(); resolve({ status, body }); });
+    req.on('error', (err) => { client.close(); reject(err); });
+    req.end(JSON.stringify(payload));
+  });
+}
+
+// Read a JSON body up to some sane limit — the LA payloads are tiny.
+function readJsonBody(req, maxBytes = 8 * 1024) {
+  return new Promise((resolve, reject) => {
+    let received = 0;
+    const chunks = [];
+    req.on('data', (chunk) => {
+      received += chunk.length;
+      if (received > maxBytes) {
+        req.destroy();
+        return reject(new Error('body too large'));
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      const buf = Buffer.concat(chunks);
+      if (!buf.length) return resolve({});
+      try { resolve(JSON.parse(buf.toString('utf8'))); }
+      catch (e) { reject(e); }
+    });
+    req.on('error', reject);
+  });
+}
+
+// ── HTTP server (health + APNs relay) ────────────────────────────────────────
+const httpServer = http.createServer(async (req, res) => {
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({
       status: 'ok',
       sessions: sessions.size,
       uptime: Math.floor(process.uptime()),
+      apnsReady: APNS_READY,
     }));
     return;
   }
+
+  // POST /apns/live-activity — plugin's Live Activity update relay.
+  // Auth: Authorization: Bearer <APNS_RELAY_TOKEN>. Body shape:
+  //   { token, arrival, distanceNm, etaMinutes, event? }
+  // event defaults to "update"; pass "end" to dismiss the activity.
+  if (req.method === 'POST' && req.url === '/apns/live-activity') {
+    if (!APNS_READY) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'apns_relay_disabled' }));
+      return;
+    }
+    // Bearer auth
+    const auth = req.headers['authorization'] || '';
+    const supplied = auth.replace(/^bearer\s+/i, '').trim();
+    if (!supplied || supplied !== APNS_RELAY_TOKEN) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'unauthorized' }));
+      return;
+    }
+    let body;
+    try { body = await readJsonBody(req); }
+    catch (e) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'bad_body', detail: e.message }));
+      return;
+    }
+    const token = String(body.token || '').trim();
+    if (!token) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'missing_token' }));
+      return;
+    }
+    const event = body.event === 'end' ? 'end' : 'update';
+    // -1 sentinel matches the SwiftUI struct's "unknown" convention.
+    const contentState = {
+      distanceNm: Number.isFinite(+body.distanceNm) ? +body.distanceNm : -1,
+      etaMinutes: Number.isFinite(+body.etaMinutes) ? +body.etaMinutes : -1,
+    };
+    const dismissAfterSeconds = event === 'end' ? 0 : null;
+    try {
+      const result = await apnsSendLiveActivity({ token, contentState, event, dismissAfterSeconds });
+      const ok = result.status === 200;
+      res.writeHead(ok ? 200 : 502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok, apns: result }));
+      if (!ok) log(`APNs push ${result.status}: ${result.body.slice(0, 200)}`);
+    } catch (e) {
+      res.writeHead(502, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ ok: false, error: 'apns_send_failed', detail: e.message }));
+      log(`APNs push exception: ${e.message}`);
+    }
+    return;
+  }
+
   res.writeHead(200, { 'Content-Type': 'text/plain' });
   res.end('ContactMe Relay Server\n');
 });
