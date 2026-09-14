@@ -39,7 +39,10 @@ const APNS_ENV       = process.env.APNS_ENV       || 'production';
 // requests to a resource that costs real quota + touches APNs.
 const APNS_RELAY_TOKEN = process.env.APNS_RELAY_TOKEN || '';
 
-const APNS_READY = APNS_KEY_P8 && APNS_KEY_ID && APNS_TEAM_ID && APNS_RELAY_TOKEN;
+// Boolean-coerce — using bare `&&` would return the last truthy VALUE
+// (the secret token), which then got exposed via the /health endpoint's
+// `apnsReady` field. Never let a config check hand you a credential.
+const APNS_READY = Boolean(APNS_KEY_P8 && APNS_KEY_ID && APNS_TEAM_ID && APNS_RELAY_TOKEN);
 if (!APNS_READY) {
   console.warn('[apns] Live Activity relay DISABLED — missing one of APNS_KEY_P8, APNS_KEY_ID, APNS_TEAM_ID, APNS_RELAY_TOKEN.');
 }
