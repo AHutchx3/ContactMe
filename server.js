@@ -185,9 +185,12 @@ const httpServer = http.createServer(async (req, res) => {
     }
     const event = body.event === 'end' ? 'end' : 'update';
     // -1 sentinel matches the SwiftUI struct's "unknown" convention.
+    // displayMode: 0 = compact pill shows distance, 1 = shows ETA. Plugin
+    // alternates on each push so the pill cycles at the push cadence.
     const contentState = {
       distanceNm: Number.isFinite(+body.distanceNm) ? +body.distanceNm : -1,
       etaMinutes: Number.isFinite(+body.etaMinutes) ? +body.etaMinutes : -1,
+      displayMode: Number.isFinite(+body.displayMode) ? (+body.displayMode) & 1 : 0,
     };
     const dismissAfterSeconds = event === 'end' ? 0 : null;
     try {
