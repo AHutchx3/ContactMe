@@ -251,9 +251,11 @@ function getOrCreateSession(cid) {
   return sessions.get(cid);
 }
 
-// Parse a client→host frame and, if it's one of the registration types,
-// stash the raw text so we can replay it when a host attaches later.
-// Non-text frames and un-parseable JSON are ignored (passthrough only).
+// Parse a client→host frame to keep the registration buffer in sync.
+// A registration frame is stashed for later replay; an unregister frame
+// clears the corresponding slot so a plugin reconnect after a flight
+// doesn't resurrect a stale Live Activity push loop. Non-text frames and
+// un-parseable JSON are ignored (passthrough only).
 function maybeBuffer(session, data, isBinary) {
   if (isBinary) return;
   let text;
@@ -264,8 +266,19 @@ function maybeBuffer(session, data, isBinary) {
   let parsed;
   try { parsed = JSON.parse(text); } catch { return; }
   const type = parsed && parsed.type;
-  if (type && BUFFERED_TYPES.has(type)) {
+  if (!type) return;
+  if (BUFFERED_TYPES.has(type)) {
     session.buffered[type] = text;
+    return;
+  }
+  // Clear both activity slots when the phone ends its Live Activity. The
+  // phone sends one unregister for either platform, so wipe both. Without
+  // this, Railway's ~60s idle-close triggers a plugin reconnect, replay
+  // fires the cached register_arrival_activity_*, and the plugin resumes
+  // pushing updates to an activity the phone has long since ended.
+  if (type === 'unregister_arrival_activity_token') {
+    session.buffered.register_arrival_activity_token = null;
+    session.buffered.register_arrival_activity_android = null;
   }
 }
 
