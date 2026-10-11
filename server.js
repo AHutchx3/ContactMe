@@ -212,14 +212,91 @@ const httpServer = http.createServer(async (req, res) => {
 });
 
 // ── Session store ─────────────────────────────────────────────────────────────
-// sessions: Map<cid, { host: WebSocket | null, clients: Set<WebSocket> }>
+// sessions: Map<cid, {
+//   host: WebSocket | null,
+//   clients: Set<WebSocket>,
+//   // Buffered registration frames so a late-joining host (plugin) still
+//   // gets the phone's push token when the phone connected first. Each
+//   // slot holds the raw frame string that the phone sent, keyed by type,
+//   // so a reconnect with a fresh token overwrites the old value. Replay
+//   // happens on host-connect; frames are plain strings (not Buffers).
+//   buffered: {
+//     register_push_token: string | null,
+//     register_arrival_activity_android: string | null,
+//     register_arrival_activity_token: string | null,
+//   },
+// }>
 const sessions = new Map();
+
+// Message types to stash. These are small, idempotent registrations the
+// plugin needs on startup — never commands or user traffic.
+const BUFFERED_TYPES = new Set([
+  'register_push_token',
+  'register_arrival_activity_android',
+  'register_arrival_activity_token',
+]);
 
 function getOrCreateSession(cid) {
   if (!sessions.has(cid)) {
-    sessions.set(cid, { host: null, clients: new Set() });
+    sessions.set(cid, {
+      host: null,
+      clients: new Set(),
+      buffered: {
+        register_push_token: null,
+        register_arrival_activity_android: null,
+        register_arrival_activity_token: null,
+      },
+    });
   }
   return sessions.get(cid);
+}
+
+// Parse a client→host frame to keep the registration buffer in sync.
+// A registration frame is stashed for later replay; an unregister frame
+// clears the corresponding slot so a plugin reconnect after a flight
+// doesn't resurrect a stale Live Activity push loop. Non-text frames and
+// un-parseable JSON are ignored (passthrough only).
+function maybeBuffer(session, data, isBinary) {
+  if (isBinary) return;
+  let text;
+  try {
+    text = typeof data === 'string' ? data : data.toString('utf8');
+  } catch { return; }
+  if (!text || text[0] !== '{') return;
+  let parsed;
+  try { parsed = JSON.parse(text); } catch { return; }
+  const type = parsed && parsed.type;
+  if (!type) return;
+  if (BUFFERED_TYPES.has(type)) {
+    session.buffered[type] = text;
+    return;
+  }
+  // Clear both activity slots when the phone ends its Live Activity. The
+  // phone sends one unregister for either platform, so wipe both. Without
+  // this, Railway's ~60s idle-close triggers a plugin reconnect, replay
+  // fires the cached register_arrival_activity_*, and the plugin resumes
+  // pushing updates to an activity the phone has long since ended.
+  if (type === 'unregister_arrival_activity_token') {
+    session.buffered.register_arrival_activity_token = null;
+    session.buffered.register_arrival_activity_android = null;
+  }
+}
+
+// Replay stashed registrations to a freshly connected host. Order
+// doesn't matter — each is self-contained — but we send push_token
+// first so a plugin that logs on connect has the common case ready.
+function replayBuffered(session) {
+  const host = session.host;
+  if (!host || host.readyState !== 1) return;
+  const order = [
+    'register_push_token',
+    'register_arrival_activity_android',
+    'register_arrival_activity_token',
+  ];
+  for (const key of order) {
+    const frame = session.buffered[key];
+    if (frame) host.send(frame);
+  }
 }
 
 function cleanupSession(cid) {
@@ -267,6 +344,12 @@ wss.on('connection', (ws, req) => {
     }
     session.host = ws;
 
+    // Replay any registrations the phone sent while the host was offline.
+    // Without this, an xPilot plugin that cold-starts after the phone has
+    // already connected never receives the push token and silently sits
+    // without push capability for the rest of the flight.
+    replayBuffered(session);
+
     ws.on('message', (data, isBinary) => {
       // Forward every host message to all phone clients, preserving frame type
       session.clients.forEach((client) => {
@@ -289,6 +372,11 @@ wss.on('connection', (ws, req) => {
     session.clients.add(ws);
 
     ws.on('message', (data, isBinary) => {
+      // Snapshot registrations so a later host-connect can replay them.
+      // Done BEFORE forwarding so even if the host is online right now,
+      // the latest token is cached for a future reconnect.
+      maybeBuffer(session, data, isBinary);
+
       // Forward every client message to the host (plugin), preserving frame type
       if (session.host && session.host.readyState === 1) {
         session.host.send(data, { binary: isBinary });
