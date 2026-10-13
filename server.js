@@ -148,6 +148,10 @@ const httpServer = http.createServer(async (req, res) => {
       sessions: sessions.size,
       uptime: Math.floor(process.uptime()),
       apnsReady: APNS_READY,
+      // Which APNs environment this instance targets. Mismatch with the
+      // user's build signing is the #1 BadDeviceToken cause — expose it
+      // here so a one-liner curl diagnoses it.
+      apnsEnv: APNS_ENV,
     }));
     return;
   }
